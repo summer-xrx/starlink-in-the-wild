@@ -1,75 +1,220 @@
 import json
 import argparse
-from multiprocessing import Pool
+import asyncio
+import itertools
+from collections import Counter
+
+import dns.asyncresolver
 import dns.resolver
+from tqdm import tqdm
 
 
-DEFAULT_DNS_SERVER = "8.8.8.8"
-DEFAULT_WORKERS = 16
+DNS_SERVERS = [
+    "1.1.1.1",
+    "8.8.8.8",
+    "9.9.9.9",
+]
+
+DEFAULT_CONCURRENCY = 1000
+DEFAULT_TIMEOUT = 5.0
 
 
-def create_resolver(nameserver=DEFAULT_DNS_SERVER):
-    """
-    Create a DNS resolver instance.
-    """
-    resolver = dns.resolver.Resolver()
+stats = Counter()
+
+
+def create_resolver(nameserver):
+    resolver = dns.asyncresolver.Resolver(configure=False)
+
     resolver.nameservers = [nameserver]
+    resolver.timeout = DEFAULT_TIMEOUT
+    resolver.lifetime = DEFAULT_TIMEOUT
+
     return resolver
 
 
-def resolve_record(domain, record_type, nameserver=DEFAULT_DNS_SERVER):
-    """
-    Resolve DNS records of a given type.
-    """
-    resolver = create_resolver(nameserver)
-
+async def resolve_record(
+    resolver,
+    domain,
+    record_type
+):
     try:
-        response = resolver.resolve(domain, record_type)
-        return sorted(str(record) for record in response)
+        answer = await resolver.resolve(
+            domain,
+            record_type
+        )
+
+        return sorted(
+            str(record)
+            for record in answer
+        )
+
+    except dns.resolver.NXDOMAIN:
+        stats["NXDOMAIN"] += 1
+
+    except dns.resolver.NoAnswer:
+        stats["NoAnswer"] += 1
+
+    except dns.resolver.NoNameservers:
+        stats["NoNameservers"] += 1
+
+    except dns.exception.Timeout:
+        stats["Timeout"] += 1
+
     except Exception:
-        return None
+        stats["OtherError"] += 1
+
+    return None
 
 
-def resolve_domain(domain):
-    """
-    Resolve both A and AAAA records for a domain.
-    """
+async def resolve_domain(
+    domain,
+    resolver
+):
     domain = domain.strip()
 
-    ipv4_records = resolve_record(domain, "A")
-    ipv6_records = resolve_record(domain, "AAAA")
+    ipv4_task = resolve_record(
+        resolver,
+        domain,
+        "A"
+    )
 
-    if not ipv4_records and not ipv6_records:
+    ipv6_task = resolve_record(
+        resolver,
+        domain,
+        "AAAA"
+    )
+
+    ipv4, ipv6 = await asyncio.gather(
+        ipv4_task,
+        ipv6_task
+    )
+
+    if not ipv4 and not ipv6:
         return None
 
     return {
         "domain": domain,
-        "ipv4": ipv4_records,
-        "ipv6": ipv6_records
+        "ipv4": ipv4,
+        "ipv6": ipv6
     }
 
 
-def process_domains(input_file, output_file, workers):
-    """
-    Process domains in parallel and save results.
-    """
-    with open(input_file, "r", encoding="utf-8") as f:
-        domains = f.readlines()
+async def worker(
+    queue,
+    outfile,
+    pbar,
+    resolver
+):
+    while True:
+        domain = await queue.get()
 
-    with Pool(workers) as pool:
-        results = pool.map(resolve_domain, domains)
+        if domain is None:
+            queue.task_done()
+            break
 
-    with open(output_file, "w", encoding="utf-8") as f:
-        for result in results:
+        try:
+            result = await resolve_domain(
+                domain,
+                resolver
+            )
+
             if result:
-                f.write(json.dumps(result) + "\n")
+                outfile.write(
+                    json.dumps(
+                        result,
+                        ensure_ascii=False
+                    )
+                    + "\n"
+                )
 
-    print(f"Results saved to: {output_file}")
+        finally:
+            pbar.update(1)
+            queue.task_done()
+
+
+async def process_domains(
+    input_file,
+    output_file,
+    concurrency
+):
+    with open(
+        input_file,
+        "r",
+        encoding="utf-8"
+    ) as f:
+        domains = [
+            line.strip()
+            for line in f
+            if line.strip()
+        ]
+
+    queue = asyncio.Queue()
+
+    for domain in domains:
+        queue.put_nowait(domain)
+
+    resolvers = [
+        create_resolver(server)
+        for server in DNS_SERVERS
+    ]
+
+    pbar = tqdm(
+        total=len(domains),
+        desc="Resolving"
+    )
+
+    with open(
+        output_file,
+        "w",
+        encoding="utf-8"
+    ) as outfile:
+
+        workers = []
+
+        resolver_cycle = itertools.cycle(
+            resolvers
+        )
+
+        for _ in range(concurrency):
+            workers.append(
+                asyncio.create_task(
+                    worker(
+                        queue,
+                        outfile,
+                        pbar,
+                        next(resolver_cycle)
+                    )
+                )
+            )
+
+        await queue.join()
+
+        for _ in workers:
+            queue.put_nowait(None)
+
+        await asyncio.gather(*workers)
+
+    pbar.close()
+
+    print()
+    print(
+        f"Results saved to: "
+        f"{output_file}"
+    )
+
+    print("\nStatistics:")
+
+    for key, value in stats.items():
+        print(f"{key}: {value}")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Starlink DNS leakage detection via candidate domain resolution."
+        description=(
+            "Starlink DNS leakage "
+            "detection via candidate "
+            "domain resolution."
+        )
     )
 
     parser.add_argument(
@@ -87,25 +232,25 @@ def parse_args():
     )
 
     parser.add_argument(
-        "-w",
-        "--workers",
+        "-c",
+        "--concurrency",
         type=int,
-        default=DEFAULT_WORKERS,
-        help="Number of worker processes"
+        default=DEFAULT_CONCURRENCY,
+        help="Concurrent coroutines"
     )
 
     return parser.parse_args()
 
 
-def main():
+async def main():
     args = parse_args()
 
-    process_domains(
+    await process_domains(
         input_file=args.input,
         output_file=args.output,
-        workers=args.workers
+        concurrency=args.concurrency
     )
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
